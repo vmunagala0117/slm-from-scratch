@@ -1,0 +1,11 @@
+torch
+transformers
+datasets
+tokenizers
+accelerate
+matplotlib
+numpy
+jupyterlab
+wandb
+trl
+peft

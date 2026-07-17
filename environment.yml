@@ -1,0 +1,21 @@
+name: slm
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      - torch --index-url https://download.pytorch.org/whl/cu121
+      - transformers
+      - datasets
+      - tokenizers
+      - accelerate
+      - matplotlib
+      - numpy
+      - jupyterlab
+      - wandb
+      - trl        # used for SFT/DPO in Ch9-10
+      - peft       # optional: LoRA-based fine-tuning comparisons
