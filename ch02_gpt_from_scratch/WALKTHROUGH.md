@@ -343,3 +343,76 @@ single step, and the result is a chaotic mix of fragments from different words.
 
 **This is exactly the problem self-attention solves** -- letting every character look back at
 everything before it, not just the immediately preceding one. That's Part 9 onward.
+
+---
+
+## Stage 3: The mathematical trick behind self-attention (Part 9)
+
+**Core idea, stated up front:** self-attention starts as nothing more exotic than "let each token
+average in the tokens before it." The Query/Key/Value machinery (Part 10) is just a smarter, *learned*
+way of deciding those averaging weights -- but the mechanical trick underneath is exactly the matrix
+multiplication built here. We build the same operation three ways, each replacing the last.
+
+**Running example for this section** (deliberately abstract, not characters -- this trick applies to
+any per-token feature vectors, which is what embeddings become once the real GPT model exists):
+`B=4` sequences, `T=8` tokens, `C=2` features per token, filled with `torch.randn` (seed 42). All
+numbers below are real, executed output.
+
+### Version 1 -- naive loop
+Goal: replace every token with the *average* of itself and every token before it (never tokens after
+-- that would leak future information the model shouldn't have at that position).
+```python
+xbow = torch.zeros((B, T, C))
+for b in range(B):
+    for t in range(T):
+        xprev = x[b, :t+1]              # all tokens from position 0 through t
+        xbow[b, t] = torch.mean(xprev, dim=0)
+```
+Correct, but two nested Python loops -- painfully slow at real scale (`T=1024`, `B=64` in production).
+
+### Version 2 -- the same result via matrix multiplication
+**Key insight: a lower-triangular matrix of 1s, row-normalized, IS an averaging operation when
+multiplied against your data.**
+```
+torch.tril(torch.ones(4, 4))          row-normalized:
+[[1., 0., 0., 0.],                    [[1.0000, 0.0000, 0.0000, 0.0000],
+ [1., 1., 0., 0.],          ->         [0.5000, 0.5000, 0.0000, 0.0000],
+ [1., 1., 1., 0.],                     [0.3333, 0.3333, 0.3333, 0.0000],
+ [1., 1., 1., 1.]]                     [0.2500, 0.2500, 0.2500, 0.2500]]
+```
+Row `t` has 1s in columns `0..t` ("I can see these") and 0s after ("future, invisible"). Row-normalizing
+turns "can see" into "equal-weighted average over everything I can see." Then:
+```python
+xbow2 = wei @ x   # (T, T) @ (B, T, C) -> (B, T, C), broadcast across the batch
+```
+One matrix multiply, run in parallel on the GPU, replaces both nested loops entirely.
+`torch.allclose(xbow, xbow2)` → `True` -- verified identical output.
+
+### Version 3 -- softmax-based masking
+Functionally identical to Version 2, but structured the way real self-attention will actually compute
+it: start from raw *scores*, mask the future with `-inf`, then softmax turns scores into normalized
+weights.
+```python
+tril = torch.tril(torch.ones(T, T))
+wei3 = torch.zeros((T, T))                          # raw "affinity scores" -- all zero for now
+wei3 = wei3.masked_fill(tril == 0, float('-inf'))   # future positions -> -inf
+wei3 = F.softmax(wei3, dim=-1)                      # -inf -> exactly 0 probability after softmax
+xbow3 = wei3 @ x
+```
+```
+Scores after masking:              After softmax:
+[[0., -inf, -inf, -inf],           [[1.0000, 0.0000, 0.0000, 0.0000],
+ [0., 0., -inf, -inf],       ->      [0.5000, 0.5000, 0.0000, 0.0000],
+ [0., 0., 0., -inf],                 [0.3333, 0.3333, 0.3333, 0.0000],
+ [0., 0., 0., 0.]]                   [0.2500, 0.2500, 0.2500, 0.2500]]
+```
+`softmax(-inf) = 0` exactly -- masking gets baked directly into the probability distribution rather than
+needing a separate normalization step. `torch.allclose(xbow, xbow3)` → `True` -- again identical.
+
+### Why this matters for Part 10
+All three versions are mathematically the same operation. Version 3's structure -- *raw scores → mask
+future with `-inf` → softmax → matmul with values* -- is **exactly** the structure real self-attention
+uses. The only thing that changes next: instead of starting from all-zero scores (which forces a
+uniform average over every visible past token), Part 10 computes the scores from learned Query and Key
+projections of the data itself. That lets the model learn *which* past tokens matter most for
+predicting the next one, instead of blindly averaging all of them equally.
