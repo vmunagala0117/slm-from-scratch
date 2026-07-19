@@ -348,19 +348,84 @@ everything before it, not just the immediately preceding one. That's Part 9 onwa
 
 ## Stage 3: The mathematical trick behind self-attention (Part 9)
 
-**Core idea, stated up front:** self-attention starts as nothing more exotic than "let each token
-average in the tokens before it." The Query/Key/Value machinery (Part 10) is just a smarter, *learned*
-way of deciding those averaging weights -- but the mechanical trick underneath is exactly the matrix
-multiplication built here. We build the same operation three ways, each replacing the last.
+### The problem, restated
+Recall the bigram model's failure: predicting the character after `h`, it had **zero information about
+what came before `h`**. Whether the source text was "t-h-e", "t-h-i-s", or "t-h-a-t", the model saw
+only `h` and had to guess blind — because each token's prediction depended *only on that token's own
+embedding row*, nothing else.
 
-**Running example for this section** (deliberately abstract, not characters -- this trick applies to
-any per-token feature vectors, which is what embeddings become once the real GPT model exists):
-`B=4` sequences, `T=8` tokens, `C=2` features per token, filled with `torch.randn` (seed 42). All
-numbers below are real, executed output.
+**What we want:** every token's representation to somehow "know about" the tokens that came before it
+-- so the vector representing `h` at that position isn't just "generic h," but something like "h, in
+the context of everything that led up to it." That's what people mean by tokens "communicating" or
+"attending to" each other.
 
-### Version 1 -- naive loop
-Goal: replace every token with the *average* of itself and every token before it (never tokens after
--- that would leak future information the model shouldn't have at that position).
+**The question Part 9 answers:** what's the simplest possible mechanism to make a token's
+representation depend on earlier tokens, in a way that's fast (parallelizable on a GPU, not a slow
+loop)? The deliberately crude answer at this stage: **averaging.**
+
+### A concrete walkthrough of the intent
+**Note:** this uses the exact same tensor the notebook actually creates (`torch.manual_seed(42)`,
+`B=4, T=8, C=2`) -- specifically the first sequence's first 4 tokens (`x[0, :4]`), so these numbers
+are reproducible by running the real cell, not a separate illustration.
+```
+Original vectors (each token described ONLY by itself):
+t0: [ 1.927,  1.487]
+t1: [ 0.901, -2.106]
+t2: [ 0.678, -1.235]
+t3: [-0.043, -1.605]
+```
+After the averaging trick:
+```
+Blended vectors (each token now describes itself + everything before it):
+t0: [ 1.927,  1.487]   <- unchanged (nothing before it to blend in)
+t1: [ 1.414, -0.309]   <- average of t0, t1
+t2: [ 1.169, -0.618]   <- average of t0, t1, t2
+t3: [ 0.866, -0.864]   <- average of t0, t1, t2, t3
+```
+Look at `t3` specifically: its original vector `[-0.043, -1.605]` described *only* token 3 in isolation.
+Its new vector `[0.866, -0.864]` is a completely different number -- because it's no longer "just token
+3," it's now a summary that has genuinely absorbed information from tokens 0, 1, and 2 as well. That,
+mechanically, is what "communication between tokens" means here: a token's outgoing representation
+stops being purely about itself and starts encoding something about its whole history.
+
+**Picture it as a fan-in diagram:** draw the 4 tokens in a row; token `t3`'s blended output has an
+equal-thickness line arriving from every earlier token (t0, t1, t2) plus itself -- 4 lines, all the
+same weight (0.25 each). Compare that to the bigram model, which had **zero** such lines -- only the
+box itself mattered.
+```mermaid
+flowchart LR
+    t0["t0"] -->|0.25| t3b["blended t3"]
+    t1["t1"] -->|0.25| t3b
+    t2["t2"] -->|0.25| t3b
+    t3["t3"] -->|0.25| t3b
+```
+
+### The important caveat -- why plain averaging isn't the real answer yet
+Uniform averaging alone is a weak, naive mechanism, and Part 9 knows that -- it's a deliberate
+stepping stone, not the destination. Three real problems with it:
+1. **Every past token gets equal weight**, regardless of relevance. Predicting after `q`, the letter
+   `u` (however far back) should matter enormously -- plain averaging can't give it special emphasis
+   over some irrelevant character in between.
+2. **Dilution as context grows.** By token 1000, the average of 1000 tokens has diluted any individual
+   token's influence to almost nothing -- no ability to sharply focus on one specific important thing.
+3. **Nothing is learned.** The weights are fixed at `1/(t+1)` for everyone, always -- no way for the
+   model to adapt what it attends to based on actual content.
+
+**This is exactly what Part 10 fixes.** Instead of a fixed uniform-weight matrix, self-attention
+computes the weights from learned Query and Key projections of the data itself -- so instead of
+"average everything equally," the model learns something closer to "strongly weight *that* earlier
+token, barely weight this other one." The matrix-multiply *mechanism* built below stays identical --
+only where the weights come from changes.
+
+**One-line summary: Part 9 builds the plumbing -- a fast, parallelizable way to blend information
+across positions via a weight matrix. Part 10 makes those weights learnable instead of fixed, which is
+what actually solves the bigram model's problem.**
+
+
+
+### Version 1 -- naive loop, tied to the fan-in picture
+Goal: replace every token with the average of itself and every token before it (never tokens after --
+that would leak future information the model shouldn't have at that position).
 ```python
 xbow = torch.zeros((B, T, C))
 for b in range(B):
@@ -368,30 +433,61 @@ for b in range(B):
         xprev = x[b, :t+1]              # all tokens from position 0 through t
         xbow[b, t] = torch.mean(xprev, dim=0)
 ```
-Correct, but two nested Python loops -- painfully slow at real scale (`T=1024`, `B=64` in production).
+Walking it through our 4-token example, position by position -- each step asks "how many fan-in lines
+are active *at this position*?":
+```
+t=0: only itself active (0 incoming lines)          -> xbow[0] = [ 1.927,  1.487]
+t=1: 1 incoming line (from t0)                       -> xbow[1] = [ 1.414, -0.309]
+t=2: 2 incoming lines (from t0, t1)                  -> xbow[2] = [ 1.169, -0.618]
+t=3: 3 incoming lines (from t0, t1, t2)               -> xbow[3] = [ 0.866, -0.864]
+```
+This is the "growing fan" -- earlier positions have a smaller, partial fan simply because they don't
+have as much history yet. That growth pattern (0 lines, then 1, then 2, then 3) is exactly what the
+triangular shape in Version 2 encodes directly as a matrix. Correct, but two nested Python loops --
+painfully slow at real scale (`T=1024`, `B=64` in production).
 
-### Version 2 -- the same result via matrix multiplication
+### Version 2 -- the matrix *is* the fan diagram, written as numbers
 **Key insight: a lower-triangular matrix of 1s, row-normalized, IS an averaging operation when
 multiplied against your data.**
 ```
-torch.tril(torch.ones(4, 4))          row-normalized:
-[[1., 0., 0., 0.],                    [[1.0000, 0.0000, 0.0000, 0.0000],
- [1., 1., 0., 0.],          ->         [0.5000, 0.5000, 0.0000, 0.0000],
- [1., 1., 1., 0.],                     [0.3333, 0.3333, 0.3333, 0.0000],
- [1., 1., 1., 1.]]                     [0.2500, 0.2500, 0.2500, 0.2500]]
+torch.tril(torch.ones(4, 4))          row-normalized (each row = that token's fan-in weights):
+[[1., 0., 0., 0.],                    [[1.00, 0.00, 0.00, 0.00],   <- t0: no fan-in, 100% self
+ [1., 1., 0., 0.],          ->         [0.50, 0.50, 0.00, 0.00],   <- t1: 2 equal lines
+ [1., 1., 1., 0.],                     [0.33, 0.33, 0.33, 0.00],   <- t2: 3 equal lines
+ [1., 1., 1., 1.]]                     [0.25, 0.25, 0.25, 0.25]]   <- t3: 4 equal lines (the fan picture)
 ```
 Row `t` has 1s in columns `0..t` ("I can see these") and 0s after ("future, invisible"). Row-normalizing
-turns "can see" into "equal-weighted average over everything I can see." Then:
+turns "can see" into "equal-weighted average over everything I can see" -- and row `t3`'s
+`[0.25, 0.25, 0.25, 0.25]` is literally "4 equal-thickness fan-in lines," matching the picture directly.
 ```python
 xbow2 = wei @ x   # (T, T) @ (B, T, C) -> (B, T, C), broadcast across the batch
 ```
-One matrix multiply, run in parallel on the GPU, replaces both nested loops entirely.
-`torch.allclose(xbow, xbow2)` → `True` -- verified identical output.
+**The actual arithmetic, worked by hand for two rows** (`wei @ x` computes, for every output position
+`t` and every feature channel `c`: `output[t,c] = sum over s of wei[t,s] * x[s,c]` -- a dot product
+between that row of weights and that column of the data):
+```
+Row t=2 weights: [0.333, 0.333, 0.333, 0.000]
+  output[2,0] = 0.333*1.927 + 0.333*0.901 + 0.333*0.678  = 1.1687
+  output[2,1] = 0.333*1.487 + 0.333*(-2.106) + 0.333*(-1.235) = -0.6176
 
-### Version 3 -- softmax-based masking
-Functionally identical to Version 2, but structured the way real self-attention will actually compute
-it: start from raw *scores*, mask the future with `-inf`, then softmax turns scores into normalized
-weights.
+Row t=3 weights: [0.250, 0.250, 0.250, 0.250]
+  output[3,0] = 0.25*1.927 + 0.25*0.901 + 0.25*0.678 + 0.25*(-0.043) = 0.8657
+  output[3,1] = 0.25*1.487 + 0.25*(-2.106) + 0.25*(-1.235) + 0.25*(-1.605) = -0.8644
+```
+These match `xbow[2]` and `xbow[3]` from the loop version exactly -- confirming the matmul is doing
+nothing more mysterious than a weighted sum per row, computed for every row simultaneously. In the
+real batched case, `x` has shape `(B, T, C)` while `wei` is only `(T, T)` -- PyTorch broadcasts the
+2D weight matrix across the batch dimension, applying the *identical* weighting scheme to every
+sequence in the batch in one call, rather than looping over `B` separately.
+
+One matrix multiply, run in parallel on the GPU, replaces both nested loops entirely -- every row of
+the matrix independently produces its own blended output *simultaneously*, instead of the loop visiting
+positions one at a time. `torch.allclose(xbow, xbow2)` -> `True` -- verified identical output.
+
+### Version 3 -- same fan diagram, built from "scores" instead of hard-coded weights
+Version 2 hard-codes the weights as `1/(t+1)` directly. Version 3 instead starts from raw *scores*
+(here, all zeros) and derives the identical weights through masking + softmax -- the structure real
+self-attention will actually use.
 ```python
 tril = torch.tril(torch.ones(T, T))
 wei3 = torch.zeros((T, T))                          # raw "affinity scores" -- all zero for now
@@ -400,19 +496,164 @@ wei3 = F.softmax(wei3, dim=-1)                      # -inf -> exactly 0 probabil
 xbow3 = wei3 @ x
 ```
 ```
-Scores after masking:              After softmax:
+Scores after masking:              After softmax (identical to Version 2's weights):
 [[0., -inf, -inf, -inf],           [[1.0000, 0.0000, 0.0000, 0.0000],
  [0., 0., -inf, -inf],       ->      [0.5000, 0.5000, 0.0000, 0.0000],
  [0., 0., 0., -inf],                 [0.3333, 0.3333, 0.3333, 0.0000],
  [0., 0., 0., 0.]]                   [0.2500, 0.2500, 0.2500, 0.2500]]
 ```
 `softmax(-inf) = 0` exactly -- masking gets baked directly into the probability distribution rather than
-needing a separate normalization step. `torch.allclose(xbow, xbow3)` → `True` -- again identical.
+needing a separate normalization step. `torch.allclose(xbow, xbow3)` -> `True` -- again identical.
 
-### Why this matters for Part 10
-All three versions are mathematically the same operation. Version 3's structure -- *raw scores → mask
-future with `-inf` → softmax → matmul with values* -- is **exactly** the structure real self-attention
-uses. The only thing that changes next: instead of starting from all-zero scores (which forces a
-uniform average over every visible past token), Part 10 computes the scores from learned Query and Key
-projections of the data itself. That lets the model learn *which* past tokens matter most for
-predicting the next one, instead of blindly averaging all of them equally.
+**The softmax math, worked exactly, row `t=2`:** softmax's formula is
+`softmax(z)_i = exp(z_i) / sum_j exp(z_j)` -- exponentiate every score, then divide each by the total,
+so the result is a proper probability distribution (all values positive, summing to 1).
+```
+Row t=2 raw scores (after masking):      [0,     0,     0,     -inf]
+exp() of each:                           [1.0,   1.0,   1.0,   0.0 ]   <- exp(-inf) = 0 exactly
+sum of exp:                               3.0
+divide each by the sum:                  [0.333, 0.333, 0.333, 0.0 ]
+```
+This matches `wei[2]` from Version 2 exactly. Note *why* it comes out uniform here: every unmasked raw
+score was the same value (0), so `exp()` of each is identical (1.0), so dividing by the sum necessarily
+gives equal shares. Masking's only job in Part 9 is to zero out disallowed (future) positions -- it
+isn't yet *differentiating* between allowed positions, because there's no signal telling it to.
+
+**Preview: what happens once scores aren't all equal (this is what Part 10 actually does).** Suppose,
+hypothetically, the raw scores for row `t=2` were `[2.0, 0.5, -1.0]` (real values a Query-Key dot
+product might produce) instead of `[0, 0, 0]`:
+```
+Raw scores (position 3 masked, since t=2 can't see the future): [2.0,    0.5,    -1.0,   -inf]
+exp() of each:                                                   [7.389,  1.649,  0.368,  0.0 ]
+sum of exp:                                                       9.406
+divide each by the sum:                                          [0.786,  0.175,  0.039,  0.0 ]
+```
+Now the weights are *unequal*: token 0 gets 78.6% of the blend, token 1 gets 17.5%, token 2 only 3.9% --
+softmax turned "token 0 scored highest" into "token 0 dominates the weighted average," while still
+guaranteeing everything sums to 1 and the future stays at exactly 0. This is exactly the mechanism Part
+10 plugs real, learned Query·Key scores into -- nothing about the softmax step changes; only where the
+numbers `[2.0, 0.5, -1.0]` come from changes, from "made up for illustration" to "computed from the
+data by a trained linear layer."
+
+**Why bother with this roundabout path if the answer's the same?** Because this is the exact
+computational shape self-attention uses -- and in Part 10, those starting "scores" stop being zero.
+They become the dot product of a learned Query vector (from the current token) and learned Key vectors
+(from every earlier token) -- so instead of every fan-in line being forced equal by construction, the
+model computes *how relevant* each earlier token actually is, and softmax turns those relevance scores
+into unequal line-thicknesses. The fan diagram doesn't change shape -- only the thickness of each line
+stops being hard-coded and starts being learned from data.
+
+---
+
+## Stage 4: Implementing self-attention with Query, Key, Value (Part 10)
+
+**The one-sentence shift from Stage 3:** the "scores" that used to be hardcoded zeros are now computed
+from the data itself, via three separate learned linear layers -- Query, Key, and Value. Everything
+downstream (causal mask, softmax, weighted sum) is identical machinery to Version 3 above.
+
+### The intuition: a speed-dating event
+Self-attention lets tokens "talk" to each other and figure out who's relevant to whom, based on data
+rather than a fixed rule. Think of a speed-dating event where every token wants to find its best match
+among the tokens before it:
+1. **Query** -- a token's dating profile: "this is what I'm looking for."
+2. **Key** -- a token's profile: "this is who I am / what I offer."
+3. **Attention score** -- the compatibility score between a Query and a Key (their dot product).
+4. **Value** -- the actual, deep information shared once two tokens find a good match.
+
+### Architecture pipeline (the pieces, and why each exists)
+```
+Input embeddings (x)
+        |
+        v
+  ---------------------------
+  |          |              |
+Query      Key            Value        <- 3 separate learned projections, C -> head_size
+"what am I  "what do I     "what I
+looking for" contain"      actually share"
+  |          |              |
+  -----------+              |
+        |                   |
+        v                   |
+Scores = Q . K (per pair)   |          <- how relevant is each past token, per query
+        |                   |
+        v                   |
+Scale by 1/sqrt(head_size)  |          <- keeps softmax from saturating (see below)
+        |                   |
+        v                   |
+Mask future with -inf       |          <- no peeking ahead during training
+        |                   |
+        v                   |
+Softmax -> percentages      |          <- turns scores into weights that sum to 1
+        |                   |
+        +-------------------+
+        v
+Output = weights . V                   <- context-aware token representation
+```
+
+### Why shrink Q and K down to `head_size` (e.g. 16) instead of keeping the full embedding width (e.g. 32)?
+Extending the dating analogy: imagine everyone's full profile has 32 traits -- hobbies, humor, values,
+career, taste in music, everything. Comparing two people by matching all 32 traits at once is expensive
+and noisy; most traits are irrelevant to "will these two get along." Instead, each token writes a
+condensed `head_size`-trait summary specifically for matching -- the Query/Key projection is that
+summary-writer, learned during training to keep only what's useful for compatibility scoring. Two
+concrete reasons this matters:
+1. **Cost.** The score matrix is always `T x T`, but computing/storing it involves vectors of length
+   `head_size` -- smaller `head_size` means less compute per pair, which matters enormously once `T` is
+   in the thousands.
+2. **Setting up Part 11 (the real payoff).** One matchmaker comparing all 32 traits at once is worse
+   than *several independent matchmakers*, each specializing in a smaller slice -- one who only cares
+   about humor compatibility, another who only cares about shared values. That's multi-head attention:
+   multiple heads, each with its own smaller `head_size`, each free to learn a *different kind* of
+   relevance. Their outputs get concatenated back together (e.g. 4 heads x `head_size=8` = 32 again) --
+   reducing dimensionality per head is what makes room for that specialization.
+
+### The masking + softmax math, real numbers, using our own `"t","h","e"` example
+An actual (untrained, randomly-initialized) attention head run on these three characters:
+```
+Raw scores, after scaling, before masking:
+Row "t": [ 0.066, -0.285,  0.049]
+Row "h": [-0.055,  0.318, -0.075]
+Row "e": [ 0.141, -0.302, -0.083]
+
+After masking the future with -inf:
+Row "t": [ 0.066, -inf,  -inf ]    <- t can only see itself
+Row "h": [-0.055, 0.318, -inf ]    <- h can see t and itself
+Row "e": [ 0.141, -0.302, -0.083]  <- e can see t, h, and itself
+
+After softmax (percentages):
+Token "t": [100.0%,   0.0%,   0.0%]  --> attends 100% to "t"
+Token "h": [ 40.8%,  59.2%,   0.0%]  --> attends 41% to "t", 59% to "h"
+Token "e": [ 41.0%,  26.3%,  32.7%]  --> attends 41% to "t", 26% to "h", 33% to "e"
+```
+The output step for `"e"`:
+```
+Output("e") = 41.0% * Value("t") + 26.3% * Value("h") + 32.7% * Value("e")
+```
+**Honest note on these numbers:** the split here is fairly mild (41/26/33) because these weights are
+completely untrained -- random initialization. A trained model would sharpen this considerably (e.g. a
+confident 90%+ toward whichever earlier character actually predicts what comes next) once it's learned
+real patterns from data. Training is precisely the process that sharpens these percentages from "mildly
+uneven" into "confidently pointing at the one earlier token that actually matters" -- the same
+sharpening we watched happen to the bigram model's weights in Stage 2, now happening to attention
+weights instead.
+
+### The fan diagram, with real weights
+Picture the token `"e"` as a query, fanning out to the three keys `t`, `h`, `e` below it -- line
+thickness proportional to the real percentages above: a thick line to `t` (41%), a medium line to `e`
+itself (33%), a thinner line to `h` (26%). Compare this to Stage 3's forced-equal fan (all lines the
+same thickness) -- the shape of the picture hasn't changed, only the thickness of each line, which now
+comes from real Query-Key compatibility instead of being hardcoded.
+
+### Final output: weighted sum of Values, not raw x
+```python
+out = wei @ v   # (B, T, T) @ (B, T, head_size) -> (B, T, head_size)
+```
+Structurally identical to Stage 3's `wei @ x`, with two changes: we're aggregating `v` (a learned
+projection) instead of the raw embeddings, and `wei` came from learned Q/K dot products instead of
+being hardcoded uniform.
+
+### Why this is "the fundamental building block"
+This single mechanism -- one "head" of self-attention -- is reused, essentially unchanged, from this
+tiny model up through GPT-4 and beyond. Part 11 wraps it into a reusable `Head` module, runs several of
+them in parallel (`MultiHeadAttention`), and combines it with a feed-forward network into a full
+`Block` -- the repeating unit that gets stacked to build the actual GPT model in Part 12.
