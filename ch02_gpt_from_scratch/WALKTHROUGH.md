@@ -879,3 +879,74 @@ Row "e" -- WEIGHTS (after masking/softmax):  [41.0%,  26.3%,  32.7%]
 Same underlying information, but scores are "raw compatibility, unnormalized" while weights are "the
 actual probability distribution used to combine Values." In code, `wei` starts life as scores and gets
 overwritten in place to become weights by the end of the function.
+
+---
+
+## Stage 6: The complete GPT model (Part 12)
+
+### Architecture stack
+```mermaid
+flowchart TD
+    IDX["idx (token indices)"] --> TE["Token embedding (B,T,C)"]
+    IDX --> PE["Position embedding (T,C), broadcasts"]
+    TE --> ADD["x = tok_emb + pos_emb"]
+    PE --> ADD
+    ADD --> BLOCKS["Block 1 ... Block n_layer<br/>same shape in, same shape out"]
+    BLOCKS --> LNF["ln_f (final LayerNorm)"]
+    LNF --> HEAD["lm_head: Linear(n_embd, vocab_size)"]
+    HEAD --> LOGITS["logits (B,T,vocab_size)"]
+```
+
+### Two new ideas this stage
+
+**Position embeddings -- why they're needed at all.** Self-attention, by itself, has no built-in sense
+of order -- it's just weighted averaging over a *set* of tokens. Nothing about the mechanism inherently
+knows "this token came first" vs "this token came last" (unlike an RNN, which processes strictly
+left-to-right). Without positional information, the word "cat" at position 0 and "cat" at position 5
+would produce *identical* representations to attention -- completely losing word order. Position
+embeddings fix this: a second embedding table, one learned vector per *position* (not per character),
+added directly onto the token embedding, so every position gets a unique fingerprint mixed in.
+
+**Stacking Blocks works precisely because of a property verified back in Part 11:** every `Block` takes
+`(B,T,n_embd)` in and returns the identical shape out. That's what makes
+`nn.Sequential(*[Block(...) for _ in range(n_layer)])` valid -- each block's output slots directly into
+the next one's input, no adapter code needed anywhere.
+
+### Real shapes, verified
+```
+tok_emb shape: (4, 8, 32)   <- (B, T, C)
+pos_emb shape: (8, 32)      <- (T, C), no batch dimension at all!
+tok_emb + pos_emb -> (4, 8, 32)   <- pos_emb broadcasts across the batch automatically
+```
+PyTorch's broadcasting handles the missing batch dimension -- the same 8 position vectors get added to
+every sequence in the batch, since "position 3" means the same thing regardless of which sequence
+you're in.
+
+### A real crash, proving why `generate()` needs one new line
+```python
+idx_cond = idx[:, -block_size:]   # NEW vs. the bigram model's generate()
+```
+The bigram model never needed this -- it only ever used the single last character regardless of how
+long the generated sequence got. This model's `position_embedding_table` only has `block_size` rows.
+Feeding a longer, uncropped sequence directly reproduces:
+```
+IndexError: index out of range in self
+```
+Confirmed by actually running it, not hypothetical. Cropping to the last `block_size` tokens before
+every forward pass during generation is what prevents position embeddings from being asked for a
+position they don't have.
+
+### Parameter count, for this small demo config
+`vocab_size=14, n_embd=32, n_head=4, n_layer=2, block_size=8` -> **26,446 total parameters**. The real
+Shakespeare-scale model (Part 13) uses `n_embd=64, n_layer=4, block_size=32` against the full 65-char
+vocabulary -- around 10M parameters, per the book. Same architecture, just larger numbers throughout
+-- this is the "differences are scale, not structure" point that carries all the way up to GPT-2 (125M)
+and beyond.
+
+### What we have now
+A complete `GPTLanguageModel` -- token + position embeddings, a stack of `n_layer` transformer
+`Block`s, a final LayerNorm, and an output head producing real vocabulary-sized logits. Untrained,
+generation is still gibberish (same as the untrained bigram model was) -- but the *architecture* is now
+structurally identical to GPT-2, LLaMA, and every other decoder-only transformer; only scale differs
+from here on. Part 13 trains this exact model at real hyperparameter scale on the full Shakespeare
+corpus.
