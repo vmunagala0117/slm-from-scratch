@@ -657,3 +657,225 @@ This single mechanism -- one "head" of self-attention -- is reused, essentially 
 tiny model up through GPT-4 and beyond. Part 11 wraps it into a reusable `Head` module, runs several of
 them in parallel (`MultiHeadAttention`), and combines it with a feed-forward network into a full
 `Block` -- the repeating unit that gets stacked to build the actual GPT model in Part 12.
+
+---
+
+## Stage 5: Building a complete transformer block (Part 11)
+
+### The intuition, extending the speed-dating analogy
+- **Multi-head attention** -- instead of one matchmaker comparing all 32 traits, hire 4 independent
+  matchmakers, each with only 8 traits to work with, each free to specialize (one might focus on
+  shared humor, another on shared values). Their separate verdicts get written side by side
+  (`torch.cat`), then a final editor (`proj`) reads all 4 opinions together and produces one combined
+  verdict.
+- **Feed-forward network** -- after the mixer event, each person goes off *alone* to think about what
+  they just heard. No cross-talk between tokens at this step; each token individually processes its own
+  gathered information (`expand` to a bigger scratch pad, then `contract` back down).
+- **LayerNorm** -- before each step, everyone's "energy level" gets normalized to the same scale, so
+  one loud, extreme-valued token can't dominate or destabilize the conversation for everyone else.
+- **Residual connection** -- a direct hotline back to who you were *before* this step, so if attention
+  or feed-forward does something unhelpful (especially early in training, when both are still
+  essentially random), you don't lose yourself entirely -- you keep the original signal plus whatever
+  useful adjustment got added.
+
+The book's own analogy table for the full stack (worth keeping alongside the above):
+| Component | Purpose | Analogy |
+|---|---|---|
+| Token embedding | Convert characters to vectors | Looking up words in a dictionary |
+| Position embedding | Add position information | Page numbers in a book |
+| Self-attention | Let tokens communicate | Cocktail party conversation |
+| Multi-head | Multiple attention perspectives | Looking from different angles |
+| Feed-forward | Process information individually | Thinking about what you heard |
+| Layer norm | Stabilize training | Keeping everyone on the same scale |
+| Residual connections | Allow gradient flow | Shortcuts through a deep network |
+
+### Architecture pipeline for the full Block
+```mermaid
+flowchart TD
+    X["x (input)"] --> LN1["LayerNorm 1"]
+    X -.->|residual path| ADD1["+ (add)"]
+    LN1 --> MHA["Multi-head attention<br/>several matchmakers in parallel"]
+    MHA --> ADD1
+    ADD1 --> LN2["LayerNorm 2"]
+    ADD1 -.->|residual path| ADD2["+ (add)"]
+    LN2 --> FF["Feed-forward<br/>each token thinks alone"]
+    FF --> ADD2
+    ADD2 --> OUT["block output<br/>(same shape as x)"]
+```
+
+### MultiHeadAttention: the real computation, traced by hand
+**When are attention weights actually generated?** Inside each `Head`, *before* concatenation happens
+-- concatenation doesn't compute anything, it only glues already-finished outputs side by side.
+`FeedForward` has no attention weights at all -- it runs after the residual-add and is a plain per-token
+`Linear -> ReLU -> Linear`, identical computation applied independently to every position.
+
+> **Common point of confusion: the attention weight matrix `wei` is `(T,T)`, but a head's OUTPUT is
+> `(T, head_size)` -- not the same shape.** The reason: `out = wei @ v`, and matrix multiplication's
+> rule `(A,B) @ (B,C) = (A,C)` means the *inner* matching dimension cancels out. `wei` is `(T,T)`, `v`
+> is `(T, head_size)`; multiplying them gives `(T, head_size)`, not `(T,T)` -- the `T×T` attention
+> matrix gets *consumed* by the matmul, it doesn't pass through to the output. What each head
+> contributes forward is `head_size`-wide, not `T`-wide.
+
+Small real example: 2 heads, `head_size=2`, `n_embd=4`, 3 tokens (`torch.manual_seed(7)`).
+
+**Head 0** runs the full Part 10 computation independently, producing its own real `3x3` attention
+weight matrix:
+```
+[[1.000, 0.000, 0.000],
+ [0.561, 0.439, 0.000],
+ [0.293, 0.356, 0.352]]
+```
+and its own output, shape `(1, 3, 2)`.
+
+**Head 1** runs the identical computation on the *same* input `x`, but with its own separately-learned
+`Linear` layers -- producing a genuinely different attention pattern:
+```
+[[1.000, 0.000, 0.000],
+ [0.688, 0.312, 0.000],
+ [0.326, 0.332, 0.342]]
+```
+Same input, different weight matrices per head -- this is the "specialization" from the dating
+analogy: two independent matchmakers, same data, different opinions.
+
+**Concatenation, by hand** -- token 0's outputs from both heads:
+```
+out0[0,0] = [-0.9630, -0.0320]     (head 0's opinion on token 0)
+out1[0,0] = [ 0.0135,  0.4249]     (head 1's opinion on token 0)
+concat[0,0] = [-0.9630, -0.0320, 0.0135, 0.4249]   <- literally just joined end-to-end
+```
+`(1,3,2)` concatenated with `(1,3,2)` along the last dimension gives `(1,3,4)` -- exactly how
+`head_size * n_head` reconstructs the full `n_embd`. Purely a stack/reshape, no computation.
+
+**The final `proj` -- where mixing actually happens:**
+
+**What `proj` actually is.** It's a real, single-layer neural network component: `nn.Linear(n_embd,
+n_embd)`, i.e. `nn.Linear(4, 4)` in our example. Concretely, it's one affine transformation: a
+learnable `4x4` weight matrix plus a learnable 4-length bias vector, computing
+`output = concat @ weight.T + bias`. It has trainable parameters, gets updated by `.backward()` + the
+optimizer just like every other layer in the model -- it's genuinely part of the network, not a fixed
+post-processing step.
+
+Its job, specifically: concatenation only stacked head 0's and head 1's numbers side by side -- they're
+still sitting in separate "lanes," never combined. `proj` is the first operation where every output
+value is a weighted sum of all 4 concatenated values -- meaning it's the first point where information
+from head 0 and head 1 can actually mix into a shared representation, rather than sitting adjacent but
+isolated.
+```
+proj.weight shape: (4, 4)
+final[0,0,0] = sum(concat[0,0,:] * proj.weight[0,:]) + bias[0] = -0.0282   (verified exact match)
+```
+
+**Shape flow, visually:**
+```mermaid
+flowchart TD
+    W["wei (weights)<br/>shape (T,T) = (3,3)"] --> MM["wei @ v"]
+    V["v (values)<br/>shape (T,head_size) = (3,2)"] --> MM
+    MM --> HO["head output<br/>shape (T,head_size) = (3,2)<br/>NOT (T,T) -- middle T cancels"]
+    HO --> H0["head 0 output (3,2)"]
+    HO --> H1["head 1 output (3,2)"]
+    H0 --> CAT["torch.cat(dim=-1)<br/>shape (T,n_embd) = (3,4)"]
+    H1 --> CAT
+    CAT --> PROJ["proj: nn.Linear(4,4)<br/>mixes heads together"]
+```
+
+
+`n_embd=32, n_head=4` -> `head_size = 32 // 4 = 8`.
+```
+Each individual head's output shape: (4, 8, 8)          -- (B, T, head_size)
+After torch.cat(...) of all 4 heads: (4, 8, 32)          -- back to full n_embd width
+After final proj (mixes info ACROSS heads): (4, 8, 32)
+```
+Each head produces its own 8-wide opinion; concatenating stacks all 4 side by side without mixing them;
+the final `proj` linear layer is what actually lets information from different heads combine into one
+unified representation.
+
+### FeedForward: real shapes
+```
+Layer 1 (expand):   Linear(32 -> 128)
+Layer 2 (contract):  Linear(128 -> 32)
+Input shape: (4, 8, 32), Output shape: (4, 8, 32)   -- same shape in and out
+```
+The `4x` expansion ratio matches GPT-2's convention -- temporary extra "scratch space" for the ReLU
+nonlinearity to compute something useful in, before compressing back to the model's working width.
+
+### LayerNorm, worked by hand
+One token's 5 raw feature values, deliberately uneven:
+```
+Before: [10.0, 2.0, 30.0, 4.0, 54.0]
+mean = 20.0, std = 19.68
+After (manual):        [-0.508, -0.915,  0.508, -0.813,  1.728]
+After (nn.LayerNorm):  [-0.508, -0.915,  0.508, -0.813,  1.728]   <- exact match
+New mean: 0.000000, new std: 1.0000
+```
+This is what "keeping everyone on the same scale" means concretely: every token's own features get
+independently recentered to mean 0 and rescaled to std 1, regardless of how extreme the raw values
+were -- so no single token's raw magnitude can dominate or destabilize the layers that follow.
+
+### Residual connections, why they matter -- real numbers
+Simulating a still-weak, nearly-untrained sublayer (output magnitude ~0.01, tiny):
+```
+Without residual: output norm = 0.32    <- original signal nearly destroyed
+With residual:     output norm = 31.69   <- original x survives, plus a small adjustment
+```
+Early in training, sublayers haven't learned anything useful yet. Without the `+x` shortcut, a weak or
+noisy sublayer would actively erase useful information at every layer, compounding badly across many
+stacked blocks. The residual guarantees the original signal always survives; the sublayer only ever
+*adds* a refinement on top, never replaces the signal outright.
+
+### The full Block, assembled
+```python
+class Block(nn.Module):
+    def __init__(self, n_embd, n_head):
+        super().__init__()
+        head_size = n_embd // n_head
+        self.sa = MultiHeadAttention(n_head, head_size)
+        self.ffwd = FeedForward(n_embd)
+        self.ln1 = nn.LayerNorm(n_embd)
+        self.ln2 = nn.LayerNorm(n_embd)
+
+    def forward(self, x):
+        x = x + self.sa(self.ln1(x))     # attention sub-layer, pre-normed, residual-wrapped
+        x = x + self.ffwd(self.ln2(x))   # feed-forward sub-layer, pre-normed, residual-wrapped
+        return x
+```
+**Pre-norm** (normalize *before* the sublayer, not after) is more stable to train than the original
+Transformer paper's post-norm design, and is standard in modern LLMs. Verified: a `Block` takes
+`(B, T, n_embd)` in and returns the exact same shape out -- which is precisely what makes it possible
+to *stack* many `Block`s in sequence (Part 12): each one's output slots directly into the next one's
+input, no reshaping required anywhere.
+
+### The exact sequence, spelled out (a common point of confusion)
+It's easy to assume LayerNorm happens once, somewhere between attention and feed-forward. It actually
+happens **twice**, each time immediately *before* its sublayer -- and the two residual adds are their
+own distinct steps, not folded into anything else:
+1. **LayerNorm 1** applied to `x` first (pre-norm).
+2. **Multi-head attention** runs on that normalized input -- each head independently computes
+   `q, k, v` -> `wei = softmax(mask(scale(q @ k.T)))` -> `out = wei @ v`.
+3. **Concatenation**, then **`proj`** (mixes across heads) -- both happen *inside* step 2
+   (`self.sa(...)`), not as a separate step.
+4. **Residual add**: `x = x + attention_output` -- the *original*, pre-norm `x` gets added back here,
+   not the normalized version.
+5. **LayerNorm 2** applied to that result.
+6. **Feed-forward** runs on the normalized result.
+7. **Residual add** again: `x = x + feedforward_output`.
+
+Skipping the residual adds (treating them as implicit rather than explicit steps) silently removes the
+entire benefit demonstrated earlier (the `0.32` vs `31.69` output-norm comparison) -- they must happen
+as their own `+` operations, not be assumed to happen automatically.
+
+### Attention scores vs. attention weights -- these are different things
+The code reuses the variable name `wei` for both, which tends to blur the distinction:
+- **Attention scores** (a.k.a. "affinities" or "logits") -- the *raw* output of
+  `q @ k.transpose(-2,-1) * scale`, *before* masking and softmax. Unbounded real numbers; don't sum to
+  anything meaningful.
+- **Attention weights** -- what you get *after* masking + softmax. Bounded between 0 and 1, every row
+  sums to exactly 1 -- a genuine probability distribution.
+
+Using the real `"t","h","e"` numbers from earlier in this section:
+```
+Row "e" -- SCORES (before masking/softmax):  [ 0.141, -0.302, -0.083]
+Row "e" -- WEIGHTS (after masking/softmax):  [41.0%,  26.3%,  32.7%]
+```
+Same underlying information, but scores are "raw compatibility, unnormalized" while weights are "the
+actual probability distribution used to combine Values." In code, `wei` starts life as scores and gets
+overwritten in place to become weights by the end of the function.
