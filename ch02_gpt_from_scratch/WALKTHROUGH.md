@@ -939,9 +939,11 @@ position they don't have.
 ### Parameter count, for this small demo config
 `vocab_size=14, n_embd=32, n_head=4, n_layer=2, block_size=8` -> **26,446 total parameters**. The real
 Shakespeare-scale model (Part 13) uses `n_embd=64, n_layer=4, block_size=32` against the full 65-char
-vocabulary -- around 10M parameters, per the book. Same architecture, just larger numbers throughout
--- this is the "differences are scale, not structure" point that carries all the way up to GPT-2 (125M)
-and beyond.
+vocabulary -- **0.21M parameters** in practice (verified by actually running it -- an earlier draft of
+this doc guessed "~10M" from a different, larger illustrative example in the book; that number belongs
+to a different chapter's config, not this one). Same architecture either way, just larger numbers
+throughout -- this is the "differences are scale, not structure" point that carries all the way up to
+GPT-2 (125M) and beyond.
 
 ### What we have now
 A complete `GPTLanguageModel` -- token + position embeddings, a stack of `n_layer` transformer
@@ -950,3 +952,181 @@ generation is still gibberish (same as the untrained bigram model was) -- but th
 structurally identical to GPT-2, LLaMA, and every other decoder-only transformer; only scale differs
 from here on. Part 13 trains this exact model at real hyperparameter scale on the full Shakespeare
 corpus.
+
+---
+
+## Stage 7-8: Training the full model, and plotting the curve (Parts 13-14)
+
+### What's new in the training setup
+- **`.to(device)`** -- moves both the model's parameters and every data batch onto whichever device
+  (`cuda` or `cpu`) is available. Model and data must be on the *same* device or PyTorch raises an
+  error -- this is why `get_batch` now calls `.to(device)` on `x, y` too, not just the model.
+- **`estimate_loss()` and why it flips `model.eval()`/`model.train()`:** covered in full detail below.
+- **`@torch.no_grad()`** disables gradient tracking for the whole function -- since we're only
+  *measuring* loss here, not training on it, computing gradients would waste compute/memory for no
+  benefit.
+- **Averaging over `eval_iters` batches** rather than just one -- a single batch's loss is noisy
+  (a random sample of characters); averaging many batches gives a stable, trustworthy estimate.
+
+### What Dropout actually does, train vs. eval -- real numbers
+```
+Input:            [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+
+TRAIN mode (p=0.2): [0.0, 2.5, 3.75, 0.0, 6.25, 7.5, 8.75, 10.0]
+EVAL mode:          [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]   <- identical to input
+```
+In **train mode**, `Dropout(p=0.2)` randomly zeroes ~20% of values (positions 0 and 3 here), and --
+easy to miss -- **scales every surviving value up by `1/(1-p)`** (`1/0.8 = 1.25x`, so `2.0 -> 2.5`).
+That scaling keeps the *expected sum* of activations the same whether or not dropout is active, so the
+next layer isn't thrown off by a systematically smaller signal during training.
+
+In **eval mode**, Dropout does nothing at all -- pure identity function, output exactly equals input.
+This is the real mechanism behind "dropout behaves differently," not just a vague statement.
+
+### What `model.eval()` actually does (and what it does NOT do)
+```
+Before:        model.training = True,  model.drop.training = True
+model.eval()   model.training = False, model.drop.training = False   <- recurses into EVERY submodule
+```
+`model.eval()` sets a boolean flag (`self.training`) on the model *and every submodule inside it*,
+recursively. Layers like `Dropout` check that flag internally in their own `forward()` to decide which
+behavior to run. That's the entire mechanism -- a flag, checked by a handful of flag-aware layers.
+
+**Common misconception, worth being precise about: `model.eval()` does NOT disable gradient
+tracking.** Verified directly -- a tensor computed in eval mode still has `requires_grad=True`.
+Gradient tracking is controlled by the completely separate `torch.no_grad()` context manager. That's
+exactly why `estimate_loss()` uses *both*: `@torch.no_grad()` stops wasted gradient computation (we're
+only measuring, not training), while `model.eval()` switches off dropout so the loss measurement isn't
+artificially noisy.
+
+### The "why," with an analogy: training a basketball team
+**Dropout during training = the coach randomly benching 20% of players every practice.** Nobody knows
+in advance who'll sit out today. This forces every remaining player to develop more well-rounded
+skills, and forces the *team's strategy* to not depend on any one star -- because that star might be
+missing next practice. That's what "regularization" means in plain terms: preventing the model from
+over-relying on any single piece of itself.
+
+**Why NOT bench players during the actual game (evaluation)?** Because during the game, you want to see
+the team's *true, full-strength* performance -- that's what you're actually trying to measure. If you
+kept randomly benching players during the game too, two bad things happen: (1) the team looks
+artificially *worse* than it really is (playing shorthanded), and (2) every time you "measured" their
+performance, you'd get a *different* random subset of missing players -- so two measurements wouldn't
+even be comparable to each other. That's exactly why `estimate_loss()` calls `model.eval()` before
+measuring -- you want the model's honest, full-strength prediction quality, not a randomly-degraded,
+inconsistent version of it.
+
+**The same story extends to why we compare train vs. val loss (see below):** training loss is how well
+the team performs against the *specific plays they've practiced* (data they've directly seen).
+Validation loss is how well they perform against a team *they've never faced before* (unseen data). If
+training loss keeps improving while validation loss stalls, the team isn't getting better at
+basketball -- it's getting better at beating one specific, familiar opponent by memorizing that
+opponent's patterns. That's overfitting, made concrete.
+
+### Proof: what actually happens if you forget `model.eval()`
+Same model, same weights, same 5 batches (identical random seed) -- measured two ways:
+```
+WRONG (dropout mistakenly left on during "evaluation"):
+  measurement 0: loss = 2.6142
+  measurement 1: loss = 2.6998
+  measurement 2: loss = 2.6608
+  measurement 3: loss = 2.6383
+  measurement 4: loss = 2.6059
+  spread across 5 measurements: 0.0939
+
+CORRECT (model.eval() called first, dropout off):
+  measurement 0: loss = 2.6316
+  measurement 1: loss = 2.6426
+  measurement 2: loss = 2.6451
+  measurement 3: loss = 2.6323
+  measurement 4: loss = 2.6304
+  spread across 5 measurements: 0.0147
+```
+Leaving dropout on during "evaluation" makes the loss measurement ~6x noisier (0.094 vs 0.015 spread),
+even on *identical* data. If you were comparing "loss at step 1000" vs "loss at step 1100" to judge
+whether training is actually improving, that extra noise could easily mask or fake an improvement.
+`model.eval()` isn't a formality -- it's what makes two loss measurements *comparable* to each other at
+all.
+
+### `estimate_loss()`, walked through completely
+```python
+@torch.no_grad()              # stop gradient tracking for everything below -- pure measurement
+def estimate_loss():
+    out = {}
+    model.eval()                # flip dropout off, recursively, on every submodule
+    for split in ['train', 'val']:
+        losses = torch.zeros(eval_iters)      # will hold 200 individual loss values
+        for k in range(eval_iters):
+            X, Y = get_batch(split)             # one random batch
+            logits, loss = model(X, Y)          # forward pass, dropout OFF this time
+            losses[k] = loss.item()             # store this one batch's loss
+        out[split] = losses.mean()              # average all 200 -> one stable number
+    model.train()                # flip dropout back ON before returning, so real
+                                   # training resumes correctly on the next iteration
+    return out
+```
+Runs 200 separate random batches for *each* split, records each batch's loss, and averages -- because
+any single batch is noisy (a handful of random characters), but the average of 200 gives a trustworthy
+read on "how good is the model, really." Returns `{'train': ..., 'val': ...}` -- two numbers, computed
+identically except for which data they're drawn from.
+
+### Real training run (executed, reduced to 1000 iterations for CPU demo speed -- the book's real
+config uses 5000; a GPU run completes this quickly)
+```
+step   0: train loss 4.4196, val loss 4.4025    (near the ~4.17 random baseline for 65 chars)
+step 200: train loss 2.5322, val loss 2.5368
+step 400: train loss 2.4028, val loss 2.3879
+step 600: train loss 2.3063, val loss 2.3263
+step 800: train loss 2.2320, val loss 2.2249
+step 999: train loss 2.1574, val loss 2.2087
+```
+Generated text after this reduced-scale training:
+```
+WANMALICAUS:
+God bucidjitsofy sith my:
+An youle me proure and thou sher;
+...
+CONET:
+ENGY his the you thoun,,...
+```
+Notice the model already learned Shakespeare's **dialogue format** -- `NAME:` in capitals followed by a
+line of dialogue -- purely from exposure to the pattern in the data, never told explicitly to look for
+it. Individual words are still often garbled since this is a small, reduced-training-time run; the
+book's full 5000-step GPU run produces meaningfully more coherent output (see the "Expected output"
+example in the book: full character names, grammatical sentences, proper capitalization).
+
+### Parameter count, real config
+`vocab_size=65, n_embd=64, n_layer=4, block_size=32` -> **0.21M parameters** (verified by running it).
+
+### Overfitting check
+Train and validation loss should track closely together throughout -- if val loss starts climbing while
+train loss keeps falling, that's the overfitting signal introduced back in Stage 1's train/val split
+explanation. With this small a model/dataset combination, expect them to move together rather than
+diverge.
+
+### What's actually being plotted (and why train vs. val specifically)
+The plot is **not** predictions against real target values (that would be a different diagnostic, more
+common for regression tasks with continuous outputs). It's a single scalar -- the **cross-entropy loss
+number** returned by `estimate_loss()` -- measured at each `eval_interval`, once for the training split
+and once for the validation split, over the course of training. Two lines, same metric, different data
+source.
+
+**Why compare train vs. val specifically:** this is the overfitting check first set up in Stage 1's
+train/val split explanation, made visual. Two possible shapes:
+- **Healthy:** both lines fall together, roughly tracking each other -- the model is learning
+  generalizable patterns, not memorizing specific training text.
+- **Overfitting:** train loss keeps falling while validation loss stalls or starts *rising* -- the
+  model is starting to memorize the specific training data rather than learning patterns that transfer
+  to unseen text. That divergence point is exactly when further training stops helping (or starts
+  hurting) real-world performance.
+
+With this small a model (0.21M parameters) trained on a relatively large corpus (~1.1M characters)
+relative to its size, expect the healthy pattern -- both lines falling together -- rather than a
+divergence.
+
+### Chapter 2 complete
+Every piece of a real GPT has now been built from raw PyTorch tensors: tokenization, embeddings,
+self-attention (from first principles through learned Q/K/V), multi-head attention, feed-forward
+networks, LayerNorm, residual connections, and the full training loop -- ending in an actual trained
+model generating Shakespeare-*shaped* text. The architecture is structurally identical to GPT-2 and
+every other decoder-only transformer; everything from here (GPT-2 fine-tuning in Chapter 3, MiniMind's
+modern architecture upgrades in Chapters 8-10) is the same ideas at larger scale, not new concepts.
